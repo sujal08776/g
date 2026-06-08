@@ -129,13 +129,30 @@ async def _extract_video_tokens(bid):
         
     return {"total": len(tokens), "subjects": grouped}
 
+# 🔥 UPDATED: Fetch Batches with REAL Image Priority
 async def _fetch_batches():
     res = await client.get(f"{BASE_URL}/video-class")
     if res.status_code != 200: return []
     data = res.json()
     products = data.get("data", {}).get("products", []) if isinstance(data.get("data"), dict) else data.get("products", [])
     if not isinstance(products, list): return []
-    return [{"id": str(b.get("id")), "title": b.get("title", "Unknown"), "price": b.get("price", "0"), "image": b.get("image", "")} for b in products if isinstance(b, dict)]
+    
+    batches = []
+    for b in products:
+        if isinstance(b, dict):
+            # 🎯 Asli Image Priority: set_card_background_image -> set_app_image -> image
+            real_image = b.get("set_card_background_image") or b.get("set_app_image") or b.get("image", "")
+            
+            batches.append({
+                "id": str(b.get("id")),
+                "title": b.get("title", "Unknown"),
+                "sub_title": b.get("sub_title", ""),
+                "price": b.get("price", "0"),
+                "discount": b.get("discount", "0"),
+                "image": real_image,
+                "share_link": b.get("share_link", "")
+            })
+    return batches
 
 # ───────────────── 🚀 FASTAPI ROUTES ─────────────────
 app = FastAPI(title="Guidely Extractor API")
