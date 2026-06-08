@@ -16,10 +16,9 @@ API_KEY = os.getenv("GUIDELY_API_KEY", "85a1364c-0419-42d5-b4c9-5dbe71549743")
 AUTH_TOKEN = os.getenv("GUIDELY_AUTH_TOKEN", "384561026d1529e5a9fbc852f029fe160457c89b12a4c32afb568aee2a86d145ce48b14c1b5b4d9ac9a9d2942423d9ebf08a4bb3ab53687008f6137f5aa62df8")
 DEVICE_ID = os.getenv("GUIDELY_DEVICE_ID", "PQ3B.190801.04221524")
 
-# ───────────────── 🌐 GLOBAL ASYNC HTTP CLIENT (Super Fast) ─────────────────
-# httpx is non-blocking and handles thousands of concurrent requests easily
+# ───────────────── 🌐 GLOBAL ASYNC HTTP CLIENT ─────────────────
 client = httpx.AsyncClient(
-    timeout=httpx.Timeout(10.0, connect=5.0),
+    timeout=httpx.Timeout(15.0, connect=5.0),
     limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
     headers={
         "User-Agent": "Dart/3.5 (dart:io)",
@@ -31,14 +30,13 @@ client = httpx.AsyncClient(
     }
 )
 
-# ───────────────── 🛠️ CORE EXTRACTION LOGIC (ASYNC) ─────────────────
+# ───────────────── 🛠️ CORE EXTRACTION LOGIC ─────────────────
 def _extract_token(iframe):
     if not iframe or not isinstance(iframe, str): return None
     m = re.search(r'(?:access_token|token|id)=([a-zA-Z0-9\-_.]+)', iframe)
     return m.group(1) if m else None
 
 async def _fetch_drm_url(ep):
-    """Tries a single DRM endpoint"""
     try:
         r = await client.get(ep["url"], params=ep["params"], headers=ep["headers"])
         if r.status_code == 200:
@@ -50,27 +48,19 @@ async def _fetch_drm_url(ep):
     return None
 
 async def _get_m3u8(token):
-    """🔥 CONCURRENT FALLBACK: Tries all 3 endpoints simultaneously!"""
     if not token: return None
-    
     endpoints = [
         {"url": f"{DRM_BASE_URL}/new-main.php", "params": {"token": token, "device_id": DEVICE_ID}, "headers": {"User-Agent": "Dart/3.5 (dart:io)", "Content-Type": "application/json"}},
         {"url": f"{DRM_BASE_URL}/tpstream-player.php", "params": {"token": token}, "headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://guidely.in/"}},
         {"url": f"{DRM_BASE_URL}/player.php", "params": {"token": token, "device_id": DEVICE_ID}, "headers": {"User-Agent": "Dart/3.5 (dart:io)"}}
     ]
-    
-    # Create tasks for all 3 endpoints
     tasks = [_fetch_drm_url(ep) for ep in endpoints]
-    
-    # Wait for the FIRST task to complete successfully
     for coro in asyncio.as_completed(tasks):
         try:
             result = await coro
-            if result:
-                return result # Return immediately, ignoring the slow ones!
+            if result: return result
         except Exception:
             continue
-            
     return None
 
 async def _process_session(s):
@@ -91,15 +81,8 @@ async def _process_session(s):
     if not m3u8 and not pdf: return None
     return {"cat": cat, "title": title, "video": m3u8, "pdf": pdf}
 
-async def _fetch_batches_sync():
-    res = await client.get(f"{BASE_URL}/video-class")
-    if res.status_code != 200: return []
-    data = res.json()
-    products = data.get("data", {}).get("products", []) if isinstance(data.get("data"), dict) else data.get("products", [])
-    if not isinstance(products, list): return []
-    return [{"id": str(b.get("id")), "title": b.get("title", "Unknown"), "price": b.get("price", "0"), "image": b.get("image", "")} for b in products if isinstance(b, dict)]
-
-async def _extract_batch_sync(bid):
+# 🔥 Helper to fetch raw items from main API (Shared by both PDF and Video functions)
+async def _get_batch_items(bid):
     res = await client.get(f"{BASE_URL}/live-video-class-new/{bid}")
     if res.status_code != 200: raise Exception(f"Batch API Error: {res.status_code}")
     data = res.json()
@@ -109,28 +92,53 @@ async def _extract_batch_sync(bid):
         lst = data.get("data", {}).get(key) if isinstance(data.get("data"), dict) else data.get(key)
         if isinstance(lst, list): items.extend(lst)
     if not items: raise Exception("No items found in this batch")
-    
-    # 🔥 Process ALL items concurrently using asyncio.gather
+    return items
+
+# 🔥 1. PDF EXTRACTION (Instant - No extra API calls)
+async def _extract_pdfs(bid):
+    items = await _get_batch_items(bid)
+    pdfs = []
+    for s in items:
+        if not isinstance(s, dict): continue
+        cat = (s.get("catgname") or "General").strip()
+        title = (s.get("name") or "No Title").strip()
+        pdf = s.get("urlpdf") if isinstance(s.get("urlpdf"), str) else None
+        if pdf:
+            pdfs.append({"cat": cat, "title": title, "pdf": pdf})
+            
+    grouped = {}
+    for r in pdfs:
+        cat = r["cat"]
+        if cat not in grouped: grouped[cat] = []
+        grouped[cat].append({"title": r["title"], "pdf": r["pdf"]})
+        
+    return {"total": len(pdfs), "subjects": grouped}
+
+# 🔥 2. VIDEO EXTRACTION (Takes time due to DRM calls)
+async def _extract_videos(bid):
+    items = await _get_batch_items(bid)
     tasks = [_process_session(item) for item in items]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    valid = [r for r in results if isinstance(r, dict)]
+    valid = [r for r in results if isinstance(r, dict) and r.get("video")]
     
-    # Group by subject
     grouped = {}
     for r in valid:
         cat = r["cat"]
         if cat not in grouped: grouped[cat] = []
-        grouped[cat].append({"title": r["title"], "video": r["video"], "pdf": r["pdf"]})
+        grouped[cat].append({"title": r["title"], "video": r["video"]})
         
-    return {
-        "total": len(valid),
-        "video": sum(1 for r in valid if r["video"]),
-        "pdf": sum(1 for r in valid if r["pdf"]),
-        "subjects": grouped
-    }
+    return {"total": len(valid), "subjects": grouped}
 
-# ───────────────── 🚀 FASTAPI ROUTES (ENDPOINTS) ─────────────────
+async def _fetch_batches():
+    res = await client.get(f"{BASE_URL}/video-class")
+    if res.status_code != 200: return []
+    data = res.json()
+    products = data.get("data", {}).get("products", []) if isinstance(data.get("data"), dict) else data.get("products", [])
+    if not isinstance(products, list): return []
+    return [{"id": str(b.get("id")), "title": b.get("title", "Unknown"), "price": b.get("price", "0"), "image": b.get("image", "")} for b in products if isinstance(b, dict)]
+
+# ───────────────── 🚀 FASTAPI ROUTES ─────────────────
 app = FastAPI(title="Guidely Extractor API")
 
 @app.on_event("shutdown")
@@ -139,24 +147,35 @@ async def shutdown_event():
 
 @app.get("/")
 def root():
-    return {"status": "running", "message": "Guidely API is ready!", "endpoints": ["/allbatch", "/batch/{batch_id}", "/drm/{token}"]}
+    return {"status": "running", "endpoints": ["/allbatch", "/batch/{id}/pdfs", "/batch/{id}/videos", "/drm/{token}"]}
 
 @app.get("/allbatch")
 async def all_batch():
     try:
-        batches = await _fetch_batches_sync()
+        batches = await _fetch_batches()
         return {"success": True, "count": len(batches), "data": batches}
     except Exception as e:
         logger.error(f"Error in /allbatch: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/batch/{batch_id}")
-async def get_batch(batch_id: str):
+# 🔥 NEW: Separate PDF Endpoint (Instant Response)
+@app.get("/batch/{batch_id}/pdfs")
+async def get_batch_pdfs(batch_id: str):
     try:
-        result = await _extract_batch_sync(batch_id)
-        return {"success": True, "batch_id": batch_id, "data": result}
+        result = await _extract_pdfs(batch_id)
+        return {"success": True, "batch_id": batch_id, "type": "pdfs", "data": result}
     except Exception as e:
-        logger.error(f"Error in /batch/{batch_id}: {e}")
+        logger.error(f"Error in /batch/{batch_id}/pdfs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🔥 NEW: Separate Video Endpoint (Takes time, but runs independently)
+@app.get("/batch/{batch_id}/videos")
+async def get_batch_videos(batch_id: str):
+    try:
+        result = await _extract_videos(batch_id)
+        return {"success": True, "batch_id": batch_id, "type": "videos", "data": result}
+    except Exception as e:
+        logger.error(f"Error in /batch/{batch_id}/videos: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/drm/{token}")
